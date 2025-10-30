@@ -1,0 +1,33 @@
+name: Sync ANM CSVs (raw)
+on:
+  schedule: [{ cron: "0 6 * * *" }]  # 06:00 UTC = 03:00 BRT
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Baixar ANM - CFEM_Arrecadacao
+        run: |
+          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv" -o CFEM_Arrecadacao.csv
+      - name: Baixar ANM - CFEM_Distribuicao
+        run: |
+          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" -o CFEM_Distribuicao.csv
+      - name: Baixar ANM - CFEM_Autuacao
+        run: |
+          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv" -o CFEM_Autuacao.csv
+      - name: Baixar ANM - AMB Producao_Bruta
+        run: |
+          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv" -o Producao_Bruta.csv
+      - name: Baixar ANM - AMB Producao_Beneficiada
+        run: |
+          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv" -o Producao_Beneficiada.csv
+
+      - name: Commit & push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "update" || echo "sem mudanças"
+          git push
