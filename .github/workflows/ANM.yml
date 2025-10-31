@@ -1,46 +1,58 @@
-name: Sync ANM via CloudFlare and Worker (Release .gz)
+name: Sync ANM via Cloudflare Worker (Release .gz)
 
 on:
-  schedule: [{ cron: "15 6 * * *" }]   # 06:15 UTC ~ 03:15 BRT
+  schedule:
+    - cron: "15 6 * * *"   # 06:15 UTC (~03:15 BRT)
   workflow_dispatch:
 
-# << 1) Permissão de escrita p/ criar tag/release >>
 permissions:
   contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      # fetch-depth: 0 ajuda com tags
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: url-encode helper
-        run: |
-          printf '%s\n' '#!/usr/bin/env python3' 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' > urlenc.py
-          chmod +x urlenc.py
-
-      - name: Baixar via Worker e compactar
+      - name: Baixar via Worker e compactar (robusto)
         env:
-          WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"   # <<< Subdomínio-CloudFlare
+          WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
         run: |
           set -euo pipefail
+          set -x
+
+          # URL-encode via Python one-liner (ok em bash)
+          enc() { python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=""))' "$1"; }
+
           dl () {
             SRC="$1"; OUT="$2"
-            ENC=$(./urlenc.py "$SRC")
-            URL="$WORKER_BASE/?u=$ENC"
+            URL="$WORKER_BASE/?u=$(enc "$SRC")"
+            echo ">> GET $URL"
 
-            # retries + timeouts generosos
-            curl --http1.1 --ipv4 -L \
+            curl -v --http1.1 --ipv4 -L \
                  -H "User-Agent: Mozilla/5.0" \
-                 -H "Accept: text/csv,*/*;q=0.1" \
+                 -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
                  --retry 6 --retry-delay 10 --retry-all-errors \
                  --connect-timeout 60 --max-time 1800 \
                  -o "$OUT" "$URL"
-            [ -s "$OUT" ] || (echo "Falha ao baixar $SRC"; exit 28)
-            gzip -f -k "$OUT"   # gera $OUT.gz
+
+            BYTES=$(wc -c < "$OUT" | tr -d ' ')
+            echo ">> $OUT bytes=$BYTES"
+            if [ "$BYTES" -lt 64 ]; then
+              echo "!! Arquivo muito pequeno. Dump parcial:"
+              (hexdump -C "$OUT" | head -n 40) || true
+              (head -c 500 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
+              exit 66
+            fi
+
+            echo ">> Primeiras linhas:"
+            head -n 5 "$OUT" || true
+
+            gzip -f -k "$OUT"
           }
 
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  CFEM_Arrecadacao.csv
@@ -49,8 +61,7 @@ jobs:
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
 
-      # << 2) Garantir/atualizar a tag 'latest' antes da release >>
-      - name: Garantir/atualizar tag 'latest'
+      - name: Marcar tag 'latest'
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -59,16 +70,17 @@ jobs:
           git tag -f latest
           git push -f origin latest
 
-      # << 3) Passar o token via 'with.token' >>
-      - name: Publicar Release "latest"
+      - name: Publicar Release 'latest'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: latest
+          overwrite: true
           files: |
             CFEM_Arrecadacao.csv.gz
             CFEM_Distribuicao.csv.gz
             CFEM_Autuacao.csv.gz
             Producao_Bruta.csv.gz
             Producao_Beneficiada.csv.gz
-          token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
