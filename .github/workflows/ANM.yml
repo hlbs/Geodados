@@ -39,7 +39,7 @@ jobs:
                  --connect-timeout 60 --max-time 1800 \
                  -o "$OUT" "$URL"
 
-            # Validação simples (erros JSON costumam ser bem pequenos)
+            # Validação simples (erros JSON costumam ser pequenos)
             BYTES=$(wc -c < "$OUT" | tr -d ' ')
             echo ">> $OUT bytes=$BYTES"
             if [ "$BYTES" -lt 128 ]; then
@@ -69,15 +69,20 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch --tags
-          git tag -f latest
-          git push -f origin latest
+          # cria/força a tag local
+          git tag -f latest "${GITHUB_SHA}"
+          # envia explicitamente como ref de TAG
+          git push -f origin refs/tags/latest
 
       - name: Publicar Release 'latest' (.gz)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: latest
-          overwrite: true
+          generate_release_notes: true
+          make_latest: true
+          overwrite_files: true             # <-- válido; substitui assets com mesmo nome
+          fail_on_unmatched_files: true
           files: |
             CFEM_Arrecadacao.csv.gz
             CFEM_Distribuicao.csv.gz
