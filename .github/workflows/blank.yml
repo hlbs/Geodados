@@ -1,33 +1,66 @@
-name: Sync ANM CSVs (raw)
+name: Sync ANM CSVs (raw, resiliente)
+
 on:
-  schedule: [{ cron: "0 6 * * *" }]  # 06:00 UTC = 03:00 BRT
+  schedule: [{ cron: "0 6 * * *" }]   # 06:00 UTC (~03:00 BRT)
   workflow_dispatch:
+
 jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Baixar ANM - CFEM_Arrecadacao
+      - name: Baixar CSVs da ANM com retries
+        shell: bash
         run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv" -o CFEM_Arrecadacao.csv
-      - name: Baixar ANM - CFEM_Distribuicao
-        run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" -o CFEM_Distribuicao.csv
-      - name: Baixar ANM - CFEM_Autuacao
-        run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv" -o CFEM_Autuacao.csv
-      - name: Baixar ANM - AMB Producao_Bruta
-        run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv" -o Producao_Bruta.csv
-      - name: Baixar ANM - AMB Producao_Beneficiada
-        run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv" -o Producao_Beneficiada.csv
+          set -euo pipefail
 
-      - name: Commit & push
+          download() {
+            local url="$1"
+            local out="$2"
+
+            # Até 8 tentativas com backoff exponencial
+            for i in {1..8}; do
+              echo "Tentativa $i baixando: $url"
+              # Dicas para servidores temperamentais:
+              # --http1.1 : evita problemas ocasionais com HTTP/2
+              # --ipv4     : contorna DNS/IPv6 em alguns datacenters
+              # --retry-all-errors : repete em qualquer erro de rede
+              # --connect-timeout, --max-time : timeouts generosos
+              # --speed-time/--speed-limit : falha se taxa ficar muito baixa
+              curl --http1.1 --ipv4 -L \
+                   -H "User-Agent: Mozilla/5.0" \
+                   -H "Accept: text/csv,*/*;q=0.1" \
+                   --retry 5 --retry-delay 5 --retry-all-errors \
+                   --connect-timeout 60 --max-time 900 \
+                   --speed-time 60 --speed-limit 2000 \
+                   -o "$out.part" "$url" && break || true
+
+              # Backoff exponencial: 5s,10s,20s,40s...
+              sleep $((5 * 2**(i-1)))
+            done
+
+            if [[ ! -s "$out.part" ]]; then
+              echo "Falha ao baixar $url (arquivo vazio ou inexistente)."
+              exit 28
+            fi
+
+            mv "$out.part" "$out"
+            echo "OK: $(du -h "$out" | awk '{print $1}') -> $out"
+          }
+
+          # Lista de arquivos para baixar
+          download "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv" CFEM_Arrecadacao.csv
+          download "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
+          download "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"   CFEM_Autuacao.csv
+          download "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"           Producao_Bruta.csv
+          download "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"     Producao_Beneficiada.csv
+
+      - name: Commit & push (só se mudou)
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "update" || echo "sem mudanças"
-          git push
+          git diff --staged --quiet && echo "Sem mudanças" || git commit -m "update"
+          git push || true
