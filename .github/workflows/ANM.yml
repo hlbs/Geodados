@@ -1,13 +1,21 @@
-name: Sync ANM via Worker (Release .gz)
+name: Sync ANM via CloudFlare and Worker (Release .gz)
+
 on:
   schedule: [{ cron: "15 6 * * *" }]   # 06:15 UTC ~ 03:15 BRT
   workflow_dispatch:
+
+# << 1) Permissão de escrita p/ criar tag/release >>
+permissions:
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth: 0 ajuda com tags
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: url-encode helper
         run: |
@@ -41,6 +49,17 @@ jobs:
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
 
+      # << 2) Garantir/atualizar a tag 'latest' antes da release >>
+      - name: Garantir/atualizar tag 'latest'
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git fetch --tags
+          git tag -f latest
+          git push -f origin latest
+
+      # << 3) Passar o token via 'with.token' >>
       - name: Publicar Release "latest"
         uses: softprops/action-gh-release@v2
         with:
@@ -52,5 +71,4 @@ jobs:
             CFEM_Autuacao.csv.gz
             Producao_Bruta.csv.gz
             Producao_Beneficiada.csv.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
