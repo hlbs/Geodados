@@ -11,63 +11,123 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-
+    env:
+      WORKER: "https://anm.hermesbarros-eng.workers.dev"  # <- seu worker
+      CHUNK_MB: "32"                                     # tamanho dos blocos
+      MAX_RETRIES: "8"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Instalar pigz (gzip multi-core)
+      - name: Instalar pigz
         run: sudo apt-get update && sudo apt-get install -y pigz
 
-      # >>> ALTERAÇÃO PRINCIPAL: baixar DIRETO da ANM, URL CRUA (sem Worker, sem urlencode)
-      - name: Baixar ANM (CSV cru) e compactar
+      - name: Funções de download em bloco (Range)
         shell: bash
         run: |
           set -euo pipefail
-          set -x
+
+          bytes_of () { wc -c < "$1" | tr -d ' '; }
+
+          # HEAD via Worker para obter Content-Length
+          head_size () {
+            local SRC="$1"
+            curl -sI --http1.1 --ipv4 \
+              -H "User-Agent: GH-Actions" \
+              "${WORKER}/?u=${SRC}" \
+              | awk 'BEGIN{IGNORECASE=1} /^Content-Length:/{print $2}' \
+              | tr -d '\r'
+          }
+
+          # Baixa uma faixa [start..end] inclusiva
+          get_range () {
+            local SRC="$1"; local OUT="$2"; local START="$3"; local END="$4"
+            local RET=0
+            for i in $(seq 1 ${MAX_RETRIES}); do
+              RET=0
+              curl -L --fail-with-body --http1.1 --ipv4 \
+                   --connect-timeout 60 --max-time 0 \
+                   --speed-time 90 --speed-limit 16384 \
+                   -H "Range: bytes=${START}-${END}" \
+                   -H "User-Agent: GH-Actions Chunked" \
+                   -o "${OUT}.part" \
+                   "${WORKER}/?u=${SRC}" && break || RET=$?
+              echo "Range retry $i (rc=$RET) for ${START}-${END}"
+              sleep $(( 2**i < 20 ? 2**i : 20 ))
+            done
+            if [ "$RET" -ne 0 ]; then
+              echo "FALHA range ${START}-${END} (rc=${RET})"
+              return "$RET"
+            fi
+            cat "${OUT}.part" >> "${OUT}"
+            rm -f "${OUT}.part"
+          }
+
+          # Orquestra o chunked download
+          chunked_download () {
+            local SRC="$1"; local OUT="$2"
+            local SIZE=$(head_size "$SRC")
+            if [ -z "$SIZE" ]; then
+              echo "Não foi possível obter Content-Length de $SRC"
+              exit 65
+            fi
+            echo "Tamanho remoto: ${SIZE} bytes"
+
+            local CHUNK_SIZE=$(( ${CHUNK_MB} * 1024 * 1024 ))
+            local OFFSET=0
+            : > "${OUT}"  # zera
+
+            while [ "$OFFSET" -lt "$SIZE" ]; {
+              local END=$(( OFFSET + CHUNK_SIZE - 1 ))
+              if [ "$END" -ge "$SIZE" ]; then END=$(( SIZE - 1 )); fi
+              echo "Baixando bytes ${OFFSET}-${END} -> ${OUT}"
+              get_range "$SRC" "${OUT}" "$OFFSET" "$END"
+              OFFSET=$(( END + 1 ))
+            }
+
+            local HAVE=$(bytes_of "${OUT}")
+            echo "Baixado ${HAVE} bytes (esperado ${SIZE})"
+            if [ "$HAVE" -ne "$SIZE" ]; then
+              echo "Tamanho divergente. Abortando."
+              exit 66
+            fi
+
+            echo "Primeiras linhas de ${OUT}:"
+            head -n 5 "${OUT}" || true
+          }
+
+          export -f bytes_of head_size get_range chunked_download
+
+      - name: Baixar ANM via Worker (URL crua) em chunks + compactar
+        shell: bash
+        run: |
+          set -euo pipefail
           mkdir -p out
           cd out
 
           dl () {
-            SRC="$1"; OUT="$2"
-            echo ">> GET $SRC (direto da origem ANM)"
-            # Streaming + retomada + timeouts + retries agressivos
-            curl -L --fail-with-body --http1.1 --ipv4 \
-                 --retry 10 --retry-delay 10 --retry-all-errors --retry-connrefused \
-                 --connect-timeout 60 --max-time 0 \
-                 --speed-time 90 --speed-limit 16384 \
-                 --continue-at - \
-                 -H "User-Agent: Mozilla/5.0 (GitHub Actions)" \
-                 -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 -o "${OUT}.part" "$SRC"
-
-            mv "${OUT}.part" "${OUT}"
-
-            BYTES=$(wc -c < "${OUT}" | tr -d ' ')
-            echo ">> ${OUT} bytes=$BYTES"
+            local SRC="$1"; local OUT="$2"
+            echo "==> ${OUT} a partir de URL CRUA (Worker passthrough)"
+            chunked_download "$SRC" "$OUT"
+            # valida tamanho mínimo (128KB) só para detectar erro HTML
+            local BYTES=$(wc -c < "$OUT" | tr -d ' ')
             if [ "$BYTES" -lt 131072 ]; then
-              echo "!! Arquivo suspeito (muito pequeno). Dump inicial:"
-              (head -c 1024 "${OUT}" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
-              exit 66
+              echo "Arquivo suspeito (muito pequeno): $OUT ($BYTES bytes)"
+              head -c 1024 "$OUT" | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g' || true
+              exit 67
             fi
-
-            echo ">> Primeiras linhas de ${OUT}:"
-            head -n 5 "${OUT}" || true
-
-            # Compacta mantendo o CSV (se quiser apenas .gz, remova -k)
-            pigz -11 -f -k "${OUT}"      # gera ${OUT}.gz
+            pigz -11 -f -k "$OUT"
           }
 
-          # URLs CRUAS (sem encode; direto da ANM)
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"   CFEM_Arrecadacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv"  CFEM_Distribuicao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"      CFEM_Autuacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"             Producao_Bruta.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"       Producao_Beneficiada.csv
 
-      - name: Marcar tag 'latest' (forçar referência)
+      - name: Marcar tag 'latest'
         shell: bash
         run: |
           set -euo pipefail
@@ -83,8 +143,8 @@ jobs:
           tag_name: latest
           name: latest
           make_latest: true
-          generate_release_notes: true
-          overwrite_files: true           # <- em vez de "overwrite"
+          generate_release_notes: false
+          overwrite_files: true
           fail_on_unmatched_files: true
           files: |
             out/CFEM_Arrecadacao.csv.gz
