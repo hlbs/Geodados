@@ -12,9 +12,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      WORKER: "https://anm.hermesbarros-eng.workers.dev"  # <- seu worker
-      CHUNK_MB: "32"                                     # tamanho dos blocos
+      WORKER: "https://anm.hermesbarros-eng.workers.dev"  # URL do seu Worker
+      CHUNK_MB: "32"                                      # tamanho do bloco (MiB)
       MAX_RETRIES: "8"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,26 +23,27 @@ jobs:
           fetch-depth: 0
 
       - name: Instalar pigz
-        run: sudo apt-get update && sudo apt-get install -y pigz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pigz
 
-      - name: Funções de download em bloco (Range)
+      - name: Baixar ANM via Worker (URL crua) em chunks + compactar + release
         shell: bash
         run: |
           set -euo pipefail
 
           bytes_of () { wc -c < "$1" | tr -d ' '; }
 
-          # HEAD via Worker para obter Content-Length
           head_size () {
             local SRC="$1"
+            # HEAD no Worker com URL CRUA no ?u=
             curl -sI --http1.1 --ipv4 \
               -H "User-Agent: GH-Actions" \
               "${WORKER}/?u=${SRC}" \
-              | awk 'BEGIN{IGNORECASE=1} /^Content-Length:/{print $2}' \
-              | tr -d '\r'
+            | awk 'BEGIN{IGNORECASE=1} /^Content-Length:/{print $2}' \
+            | tr -d '\r'
           }
 
-          # Baixa uma faixa [start..end] inclusiva
           get_range () {
             local SRC="$1"; local OUT="$2"; local START="$3"; local END="$4"
             local RET=0
@@ -55,7 +57,7 @@ jobs:
                    -o "${OUT}.part" \
                    "${WORKER}/?u=${SRC}" && break || RET=$?
               echo "Range retry $i (rc=$RET) for ${START}-${END}"
-              sleep $(( 2**i < 20 ? 2**i : 20 ))
+              sleep $(( (2**i) < 20 ? (2**i) : 20 ))
             done
             if [ "$RET" -ne 0 ]; then
               echo "FALHA range ${START}-${END} (rc=${RET})"
@@ -65,11 +67,11 @@ jobs:
             rm -f "${OUT}.part"
           }
 
-          # Orquestra o chunked download
           chunked_download () {
             local SRC="$1"; local OUT="$2"
-            local SIZE=$(head_size "$SRC")
-            if [ -z "$SIZE" ]; then
+            local SIZE
+            SIZE="$(head_size "$SRC")"
+            if [ -z "${SIZE}" ]; then
               echo "Não foi possível obter Content-Length de $SRC"
               exit 65
             fi
@@ -77,19 +79,20 @@ jobs:
 
             local CHUNK_SIZE=$(( ${CHUNK_MB} * 1024 * 1024 ))
             local OFFSET=0
-            : > "${OUT}"  # zera
+            : > "${OUT}"
 
-            while [ "$OFFSET" -lt "$SIZE" ]; {
+            while [ "${OFFSET}" -lt "${SIZE}" ]; do
               local END=$(( OFFSET + CHUNK_SIZE - 1 ))
-              if [ "$END" -ge "$SIZE" ]; then END=$(( SIZE - 1 )); fi
+              if [ "${END}" -ge "${SIZE}" ]; then END=$(( SIZE - 1 )); fi
               echo "Baixando bytes ${OFFSET}-${END} -> ${OUT}"
-              get_range "$SRC" "${OUT}" "$OFFSET" "$END"
+              get_range "$SRC" "${OUT}" "${OFFSET}" "${END}"
               OFFSET=$(( END + 1 ))
-            }
+            done
 
-            local HAVE=$(bytes_of "${OUT}")
+            local HAVE
+            HAVE="$(bytes_of "${OUT}")"
             echo "Baixado ${HAVE} bytes (esperado ${SIZE})"
-            if [ "$HAVE" -ne "$SIZE" ]; then
+            if [ "${HAVE}" -ne "${SIZE}" ]; then
               echo "Tamanho divergente. Abortando."
               exit 66
             fi
@@ -98,21 +101,12 @@ jobs:
             head -n 5 "${OUT}" || true
           }
 
-          export -f bytes_of head_size get_range chunked_download
-
-      - name: Baixar ANM via Worker (URL crua) em chunks + compactar
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p out
-          cd out
-
           dl () {
             local SRC="$1"; local OUT="$2"
-            echo "==> ${OUT} a partir de URL CRUA (Worker passthrough)"
+            echo "==> Baixando (URL CRUA via Worker): ${SRC}"
             chunked_download "$SRC" "$OUT"
-            # valida tamanho mínimo (128KB) só para detectar erro HTML
-            local BYTES=$(wc -c < "$OUT" | tr -d ' ')
+            local BYTES
+            BYTES="$(wc -c < "$OUT" | tr -d ' ')"
             if [ "$BYTES" -lt 131072 ]; then
               echo "Arquivo suspeito (muito pequeno): $OUT ($BYTES bytes)"
               head -c 1024 "$OUT" | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g' || true
@@ -121,36 +115,33 @@ jobs:
             pigz -11 -f -k "$OUT"
           }
 
+          mkdir -p out
+          cd out
+
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"   CFEM_Arrecadacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv"  CFEM_Distribuicao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"      CFEM_Autuacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"             Producao_Bruta.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"       Producao_Beneficiada.csv
 
-      - name: Marcar tag 'latest'
-        shell: bash
-        run: |
-          set -euo pipefail
+          cd ..
+
+          # Tag 'latest' idempotente
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch --tags
           git tag -f latest "${GITHUB_SHA}"
           git push -f origin refs/tags/latest
 
-      - name: Publicar Release 'latest' (.gz)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: latest
-          make_latest: true
-          generate_release_notes: false
-          overwrite_files: true
-          fail_on_unmatched_files: true
-          files: |
-            out/CFEM_Arrecadacao.csv.gz
-            out/CFEM_Distribuicao.csv.gz
-            out/CFEM_Autuacao.csv.gz
-            out/Producao_Bruta.csv.gz
-            out/Producao_Beneficiada.csv.gz
+          # Publica release com sobrescrita de arquivos
+          gh release view latest >/dev/null 2>&1 || gh release create latest -t latest -n "" || true
+          gh release upload latest \
+            out/CFEM_Arrecadacao.csv.gz \
+            out/CFEM_Distribuicao.csv.gz \
+            out/CFEM_Autuacao.csv.gz \
+            out/Producao_Bruta.csv.gz \
+            out/Producao_Beneficiada.csv.gz \
+            --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
