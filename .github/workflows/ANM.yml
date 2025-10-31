@@ -2,7 +2,7 @@ name: Sync ANM via Cloudflare Worker (Release .gz)
 
 on:
   schedule:
-    - cron: "15 6 * * *"
+    - cron: "15 6 * * *"   # 06:15 UTC (~03:15 BRT)
   workflow_dispatch:
 
 permissions:
@@ -18,12 +18,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Instalar pigz
+      - name: Instalar pigz (gzip multi-core)
         run: sudo apt-get update && sudo apt-get install -y pigz
 
-      - name: Baixar via Worker (sem urlencode) e compactar
-        env:
-          WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
+      # >>> ALTERAÇÃO PRINCIPAL: baixar DIRETO da ANM, URL CRUA (sem Worker, sem urlencode)
+      - name: Baixar ANM (CSV cru) e compactar
         shell: bash
         run: |
           set -euo pipefail
@@ -33,38 +32,42 @@ jobs:
 
           dl () {
             SRC="$1"; OUT="$2"
-            URL="${WORKER_BASE}/?u=$SRC"   # URL crua, sem encode
-            echo ">> GET $URL"
-
+            echo ">> GET $SRC (direto da origem ANM)"
+            # Streaming + retomada + timeouts + retries agressivos
             curl -L --fail-with-body --http1.1 --ipv4 \
-                 --retry 8 --retry-delay 10 --retry-all-errors --retry-connrefused \
+                 --retry 10 --retry-delay 10 --retry-all-errors --retry-connrefused \
                  --connect-timeout 60 --max-time 0 \
-                 --speed-time 60 --speed-limit 16384 \
+                 --speed-time 90 --speed-limit 16384 \
                  --continue-at - \
-                 -H "User-Agent: Mozilla/5.0 (GitHub Actions via CF Worker)" \
+                 -H "User-Agent: Mozilla/5.0 (GitHub Actions)" \
                  -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 -o "${OUT}.part" "$URL"
+                 -o "${OUT}.part" "$SRC"
 
             mv "${OUT}.part" "${OUT}"
+
             BYTES=$(wc -c < "${OUT}" | tr -d ' ')
             echo ">> ${OUT} bytes=$BYTES"
             if [ "$BYTES" -lt 131072 ]; then
-              echo "!! Saída pequena (possível erro JSON do Worker). Dump:"
+              echo "!! Arquivo suspeito (muito pequeno). Dump inicial:"
               (head -c 1024 "${OUT}" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
               exit 66
             fi
 
+            echo ">> Primeiras linhas de ${OUT}:"
             head -n 5 "${OUT}" || true
-            pigz -11 -f -k "${OUT}"
+
+            # Compacta mantendo o CSV (se quiser apenas .gz, remova -k)
+            pigz -11 -f -k "${OUT}"      # gera ${OUT}.gz
           }
 
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  CFEM_Arrecadacao.csv
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     CFEM_Autuacao.csv
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
+          # URLs CRUAS (sem encode; direto da ANM)
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"   CFEM_Arrecadacao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv"  CFEM_Distribuicao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"      CFEM_Autuacao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"             Producao_Bruta.csv
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"       Producao_Beneficiada.csv
 
-      - name: Atualizar tag 'latest'
+      - name: Marcar tag 'latest' (forçar referência)
         shell: bash
         run: |
           set -euo pipefail
@@ -81,7 +84,7 @@ jobs:
           name: latest
           make_latest: true
           generate_release_notes: true
-          overwrite_files: true
+          overwrite_files: true           # <- em vez de "overwrite"
           fail_on_unmatched_files: true
           files: |
             out/CFEM_Arrecadacao.csv.gz
