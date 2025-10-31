@@ -1,36 +1,51 @@
-name: Sync ANM CSVs (release gz)
+name: Sync ANM via Worker (Release .gz)
 on:
-  schedule: [{ cron: "30 6 * * *" }]  # 06:30 UTC = 03:30 BRT
+  schedule: [{ cron: "15 6 * * *" }]   # 06:15 UTC ~ 03:15 BRT
   workflow_dispatch:
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Baixar CSVs ANM
+      - name: url-encode helper
         run: |
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv" -o CFEM_Arrecadacao.csv
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" -o CFEM_Distribuicao.csv
-          curl -L "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv" -o CFEM_Autuacao.csv
-          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv" -o Producao_Bruta.csv
-          curl -L "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv" -o Producao_Beneficiada.csv
+          printf '%s\n' '#!/usr/bin/env python3' 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1],safe=""))' > urlenc.py
+          chmod +x urlenc.py
 
-      - name: Compactar em .gz
+      - name: Baixar via Worker e compactar
+        env:
+          WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"   # <<< Subdomínio-CloudFlare
         run: |
-          gzip -f -k CFEM_Arrecadacao.csv
-          gzip -f -k CFEM_Distribuicao.csv
-          gzip -f -k CFEM_Autuacao.csv
-          gzip -f -k Producao_Bruta.csv
-          gzip -f -k Producao_Beneficiada.csv
+          set -euo pipefail
+          dl () {
+            SRC="$1"; OUT="$2"
+            ENC=$(./urlenc.py "$SRC")
+            URL="$WORKER_BASE/?u=$ENC"
 
-      - name: Criar/atualizar Release "latest"
+            # retries + timeouts generosos
+            curl --http1.1 --ipv4 -L \
+                 -H "User-Agent: Mozilla/5.0" \
+                 -H "Accept: text/csv,*/*;q=0.1" \
+                 --retry 6 --retry-delay 10 --retry-all-errors \
+                 --connect-timeout 60 --max-time 1800 \
+                 -o "$OUT" "$URL"
+            [ -s "$OUT" ] || (echo "Falha ao baixar $SRC"; exit 28)
+            gzip -f -k "$OUT"   # gera $OUT.gz
+          }
+
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  CFEM_Arrecadacao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     CFEM_Autuacao.csv
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
+
+      - name: Publicar Release "latest"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
           name: latest
-          draft: false
-          prerelease: false
           files: |
             CFEM_Arrecadacao.csv.gz
             CFEM_Distribuicao.csv.gz
