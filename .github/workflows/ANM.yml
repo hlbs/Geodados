@@ -21,40 +21,45 @@ jobs:
       - name: Baixar via Worker e compactar (robusto)
         env:
           WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
+        shell: bash
         run: |
           set -euo pipefail
           set -x
 
-          # URL-encode via Python one-liner (ok em bash)
+          # URL-encode (safe="")
           enc() { python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=""))' "$1"; }
 
+          # Faz download com várias tentativas e valida o conteúdo
           dl () {
             SRC="$1"; OUT="$2"
             URL="$WORKER_BASE/?u=$(enc "$SRC")"
             echo ">> GET $URL"
 
+            # Tenta até 6 vezes, com paciência para POP que esteja distante da origem
             curl -v --http1.1 --ipv4 -L \
-                 -H "User-Agent: Mozilla/5.0" \
+                 -H "User-Agent: Mozilla/5.0 (GitHub Actions via CF Worker)" \
                  -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 --retry 6 --retry-delay 10 --retry-all-errors \
+                 --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
                  --connect-timeout 60 --max-time 1800 \
                  -o "$OUT" "$URL"
 
+            # Se o Worker retornar JSON de erro (ex.: 522), geralmente fica ~161 bytes.
             BYTES=$(wc -c < "$OUT" | tr -d ' ')
             echo ">> $OUT bytes=$BYTES"
-            if [ "$BYTES" -lt 64 ]; then
-              echo "!! Arquivo muito pequeno. Dump parcial:"
+            if [ "$BYTES" -lt 128 ]; then
+              echo "!! Arquivo muito pequeno. Dump parcial para diagnóstico:"
               (hexdump -C "$OUT" | head -n 40) || true
-              (head -c 500 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
+              (head -c 800 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
               exit 66
             fi
 
-            echo ">> Primeiras linhas:"
+            echo ">> Primeiras linhas (sanity check):"
             head -n 5 "$OUT" || true
 
-            gzip -f -k "$OUT"
+            gzip -f -k "$OUT"   # cria $OUT.gz (mantém também o CSV puro no workspace)
           }
 
+          # --- Lista dos arquivos ANM a baixar via Worker ---
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  CFEM_Arrecadacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     CFEM_Autuacao.csv
@@ -62,6 +67,7 @@ jobs:
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
 
       - name: Marcar tag 'latest'
+        shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
@@ -70,7 +76,7 @@ jobs:
           git tag -f latest
           git push -f origin latest
 
-      - name: Publicar Release 'latest'
+      - name: Publicar Release 'latest' (.gz)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
@@ -84,3 +90,19 @@ jobs:
             Producao_Beneficiada.csv.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # (Opcional) Também publicar os CSV "puros", se quiser consumir direto no Power BI sem descompactar
+      # - name: Publicar Release 'latest' (CSV puros)
+      #   uses: softprops/action-gh-release@v2
+      #   with:
+      #     tag_name: latest
+      #     name: latest
+      #     overwrite: true
+      #     files: |
+      #       CFEM_Arrecadacao.csv
+      #       CFEM_Distribuicao.csv
+      #       CFEM_Autuacao.csv
+      #       Producao_Bruta.csv
+      #       Producao_Beneficiada.csv
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
