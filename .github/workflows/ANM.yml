@@ -18,7 +18,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Baixar via Worker e compactar (robusto)
+      - name: Baixar via Worker e compactar (sem urlencode)
         env:
           WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
         shell: bash
@@ -26,16 +26,12 @@ jobs:
           set -euo pipefail
           set -x
 
-          # URL-encode (safe="")
-          enc() { python3 -c 'import sys,urllib.parse as u; print(u.quote(sys.argv[1], safe=""))' "$1"; }
-
-          # Faz download com várias tentativas e valida o conteúdo
+          # Faz download usando a URL CRUA no parâmetro ?u=
           dl () {
             SRC="$1"; OUT="$2"
-            URL="$WORKER_BASE/?u=$(enc "$SRC")"
+            URL="$WORKER_BASE/?u=$SRC"   # <<-- sem urlencode
             echo ">> GET $URL"
 
-            # Tenta até 6 vezes, com paciência para POP que esteja distante da origem
             curl -v --http1.1 --ipv4 -L \
                  -H "User-Agent: Mozilla/5.0 (GitHub Actions via CF Worker)" \
                  -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
@@ -43,20 +39,20 @@ jobs:
                  --connect-timeout 60 --max-time 1800 \
                  -o "$OUT" "$URL"
 
-            # Se o Worker retornar JSON de erro (ex.: 522), geralmente fica ~161 bytes.
+            # Validação simples (erros JSON costumam ser bem pequenos)
             BYTES=$(wc -c < "$OUT" | tr -d ' ')
             echo ">> $OUT bytes=$BYTES"
             if [ "$BYTES" -lt 128 ]; then
-              echo "!! Arquivo muito pequeno. Dump parcial para diagnóstico:"
+              echo "!! Arquivo muito pequeno. Dump parcial:"
               (hexdump -C "$OUT" | head -n 40) || true
               (head -c 800 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
               exit 66
             fi
 
-            echo ">> Primeiras linhas (sanity check):"
+            echo ">> Primeiras linhas:"
             head -n 5 "$OUT" || true
 
-            gzip -f -k "$OUT"   # cria $OUT.gz (mantém também o CSV puro no workspace)
+            gzip -f -k "$OUT"   # cria $OUT.gz e mantém o .csv
           }
 
           # --- Lista dos arquivos ANM a baixar via Worker ---
@@ -89,19 +85,3 @@ jobs:
             Producao_Beneficiada.csv.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # (Opcional) Também publicar os CSV "puros", se quiser consumir direto no Power BI sem descompactar
-      # - name: Publicar Release 'latest' (CSV puros)
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     tag_name: latest
-      #     name: latest
-      #     overwrite: true
-      #     files: |
-      #       CFEM_Arrecadacao.csv
-      #       CFEM_Distribuicao.csv
-      #       CFEM_Autuacao.csv
-      #       Producao_Bruta.csv
-      #       Producao_Beneficiada.csv
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
