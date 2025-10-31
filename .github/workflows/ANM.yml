@@ -2,7 +2,7 @@ name: Sync ANM via Cloudflare Worker (Release .gz)
 
 on:
   schedule:
-    - cron: "15 6 * * *"   # 06:15 UTC (~03:15 BRT)
+    - cron: "15 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,60 +18,60 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Baixar via Worker e compactar (sem urlencode)
+      - name: Instalar pigz
+        run: sudo apt-get update && sudo apt-get install -y pigz
+
+      - name: Baixar via Worker (sem urlencode) e compactar
         env:
           WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
         shell: bash
         run: |
           set -euo pipefail
           set -x
+          mkdir -p out
+          cd out
 
-          # Faz download usando a URL CRUA no parâmetro ?u=
           dl () {
             SRC="$1"; OUT="$2"
-            URL="$WORKER_BASE/?u=$SRC"   # <<-- sem urlencode
+            URL="${WORKER_BASE}/?u=$SRC"   # URL crua, sem encode
             echo ">> GET $URL"
 
-            curl -v --http1.1 --ipv4 -L \
+            curl -L --fail-with-body --http1.1 --ipv4 \
+                 --retry 8 --retry-delay 10 --retry-all-errors --retry-connrefused \
+                 --connect-timeout 60 --max-time 0 \
+                 --speed-time 60 --speed-limit 16384 \
+                 --continue-at - \
                  -H "User-Agent: Mozilla/5.0 (GitHub Actions via CF Worker)" \
                  -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
-                 --connect-timeout 60 --max-time 1800 \
-                 -o "$OUT" "$URL"
+                 -o "${OUT}.part" "$URL"
 
-            # Validação simples (erros JSON costumam ser pequenos)
-            BYTES=$(wc -c < "$OUT" | tr -d ' ')
-            echo ">> $OUT bytes=$BYTES"
-            if [ "$BYTES" -lt 128 ]; then
-              echo "!! Arquivo muito pequeno. Dump parcial:"
-              (hexdump -C "$OUT" | head -n 40) || true
-              (head -c 800 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
+            mv "${OUT}.part" "${OUT}"
+            BYTES=$(wc -c < "${OUT}" | tr -d ' ')
+            echo ">> ${OUT} bytes=$BYTES"
+            if [ "$BYTES" -lt 131072 ]; then
+              echo "!! Saída pequena (possível erro JSON do Worker). Dump:"
+              (head -c 1024 "${OUT}" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
               exit 66
             fi
 
-            echo ">> Primeiras linhas:"
-            head -n 5 "$OUT" || true
-
-            gzip -f -k "$OUT"   # cria $OUT.gz e mantém o .csv
+            head -n 5 "${OUT}" || true
+            pigz -11 -f -k "${OUT}"
           }
 
-          # --- Lista dos arquivos ANM a baixar via Worker ---
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  CFEM_Arrecadacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
           dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     CFEM_Autuacao.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
           dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
 
-      - name: Marcar tag 'latest'
+      - name: Atualizar tag 'latest'
         shell: bash
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch --tags
-          # cria/força a tag local
           git tag -f latest "${GITHUB_SHA}"
-          # envia explicitamente como ref de TAG
           git push -f origin refs/tags/latest
 
       - name: Publicar Release 'latest' (.gz)
@@ -79,15 +79,15 @@ jobs:
         with:
           tag_name: latest
           name: latest
-          generate_release_notes: true
           make_latest: true
-          overwrite_files: true             # <-- válido; substitui assets com mesmo nome
+          generate_release_notes: true
+          overwrite_files: true
           fail_on_unmatched_files: true
           files: |
-            CFEM_Arrecadacao.csv.gz
-            CFEM_Distribuicao.csv.gz
-            CFEM_Autuacao.csv.gz
-            Producao_Bruta.csv.gz
-            Producao_Beneficiada.csv.gz
+            out/CFEM_Arrecadacao.csv.gz
+            out/CFEM_Distribuicao.csv.gz
+            out/CFEM_Autuacao.csv.gz
+            out/Producao_Bruta.csv.gz
+            out/Producao_Beneficiada.csv.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
