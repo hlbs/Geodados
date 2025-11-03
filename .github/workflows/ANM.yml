@@ -40,7 +40,7 @@ jobs:
           COMMON_CURL_OPTS=(
             -L --fail --http1.1 --ipv4
             --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused
-            --connect-timeout 60 --max-time 0
+            --connect-timeout 180 --max-time 0
             # Removidos: --speed-time 120 --speed-limit 16384
             -H "User-Agent: ${UA}"
             -H "Accept: text/csv,application/octet-stream,*/*;q=0.1"
@@ -97,10 +97,10 @@ jobs:
 
           # Arrecadação é grande → threshold maior para detectar HTML de erro
           try_all "$A_ARREC" "CFEM_Arrecadacao.csv" 4096
-          try_all "$A_DIST" "CFEM_Distribuicao.csv" 2048
-          try_all "$A_AUTO" "CFEM_Autuacao.csv" 2048
-          try_all "$P_BRUT" "Producao_Bruta.csv" 2048
-          try_all "$P_BENF" "Producao_Beneficiada.csv" 2048
+          try_all "$A_DIST" "CFEM_Distribuicao.csv" 4096
+          try_all "$A_AUTO" "CFEM_Autuacao.csv" 4096
+          try_all "$P_BRUT" "Producao_Bruta.csv" 4096
+          try_all "$P_BENF" "Producao_Beneficiada.csv" 4096
 
           echo ">> Amostras (head):"
           for f in *.csv; do
