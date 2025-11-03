@@ -1,4 +1,4 @@
-name: Sync ANM via Cloudflare Worker (Release .gz)
+name: Sync ANM → GitHub Release (CSV)
 
 on:
   schedule:
@@ -9,79 +9,104 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  sync:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Baixar via Worker e compactar (sem urlencode)
-        env:
-          WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"
+      - name: Setup tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq
+          mkdir -p out
+
+      - name: Download ANM CSVs (no urlencode, resume, retries)
         shell: bash
         run: |
           set -euo pipefail
-          set -x
+          cd out
 
-          # Faz download usando a URL CRUA no parâmetro ?u=
           dl () {
             SRC="$1"; OUT="$2"
-            URL="$WORKER_BASE/?u=$SRC"   # <<-- sem urlencode
-            echo ">> GET $URL"
-
-            curl -v --http1.1 --ipv4 -L \
-                 -H "User-Agent: Mozilla/5.0 (GitHub Actions via CF Worker)" \
+            echo ">> GET $SRC"
+            # Download resiliente com resume (--continue-at -), sem timeout total,
+            # e com retry agressivo. SEM URL-ENCODE!
+            curl -L --fail-with-body --http1.1 --ipv4 \
+                 --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused \
+                 --connect-timeout 60 --max-time 0 \
+                 --speed-time 120 --speed-limit 16384 \
+                 --continue-at - \
+                 -H "User-Agent: Mozilla/5.0 (GitHub Actions)" \
                  -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 --retry 6 --retry-delay 10 --retry-all-errors --retry-connrefused \
-                 --connect-timeout 60 --max-time 1800 \
-                 -o "$OUT" "$URL"
+                 -o "${OUT}.part" "$SRC"
 
-            # Validação simples (erros JSON costumam ser bem pequenos)
+            mv "${OUT}.part" "$OUT"
             BYTES=$(wc -c < "$OUT" | tr -d ' ')
             echo ">> $OUT bytes=$BYTES"
-            if [ "$BYTES" -lt 128 ]; then
-              echo "!! Arquivo muito pequeno. Dump parcial:"
-              (hexdump -C "$OUT" | head -n 40) || true
-              (head -c 800 "$OUT" || true) | sed -e $'s/\r/\\r/g;s/\n/\\n\\\n/g'
+            # Heurística: CSVs reais têm bem mais que 1KB; abaixo disso costuma ser HTML/erro.
+            if [ "$BYTES" -lt 1024 ]; then
+              echo "!! Arquivo muito pequeno (provável HTML de erro). Dump parcial:"
+              head -c 800 "$OUT" || true
               exit 66
             fi
 
             echo ">> Primeiras linhas:"
             head -n 5 "$OUT" || true
-
-            gzip -f -k "$OUT"   # cria $OUT.gz e mantém o .csv
           }
 
-          # --- Lista dos arquivos ANM a baixar via Worker ---
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" CFEM_Distribuicao.csv
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     CFEM_Autuacao.csv
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            Producao_Bruta.csv
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      Producao_Beneficiada.csv
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  "CFEM_Arrecadacao.csv"
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" "CFEM_Distribuicao.csv"
+          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     "CFEM_Autuacao.csv"
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            "Producao_Bruta.csv"
+          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      "Producao_Beneficiada.csv"
 
-      - name: Marcar tag 'latest'
+      - name: Remove release/tag 'latest' if exists (avoid conflicts)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git fetch --tags
-          git tag -f latest
-          git push -f origin latest
 
-      - name: Publicar Release 'latest' (.gz)
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: latest
-          name: latest
-          overwrite: true
-          files: |
-            CFEM_Arrecadacao.csv.gz
-            CFEM_Distribuicao.csv.gz
-            CFEM_Autuacao.csv.gz
-            Producao_Bruta.csv.gz
-            Producao_Beneficiada.csv.gz
+          # Deleta release 'latest' se existir (ignorando erro)
+          if gh release view latest >/dev/null 2>&1; then
+            echo ">> Deletando release 'latest'…"
+            gh release delete latest -y || true
+          fi
+
+          # Deleta tag local e remota 'latest' se existirem
+          git tag -d latest 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+
+      - name: Create release 'latest' and upload CSV files (no gzip)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+
+          echo ">> Criando release 'latest'…"
+          gh release create latest \
+            --title "latest" \
+            --notes "Atualização automática dos dados ANM (CSV sem URL-encode)" \
+            --latest
+
+          echo ">> Enviando assets CSV…"
+          # gh lida com arquivos grandes como asset de release (limite por arquivo ~2GB)
+          gh release upload latest \
+            CFEM_Arrecadacao.csv \
+            CFEM_Distribuicao.csv \
+            CFEM_Autuacao.csv \
+            Producao_Bruta.csv \
+            Producao_Beneficiada.csv \
+            --clobber
+
+      - name: Show release assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
