@@ -2,14 +2,14 @@ name: Sync ANM → GitHub Release (via CF Worker, CSV cru + fallback)
 
 on:
   schedule:
-    - cron: "15 6 * * *"
+    - cron: "15 6 * * *"  # 06:15 UTC (~03:15 BRT)
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev" # ?u=URL CRUA
+  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"  # usa ?u=URL CRUA
   UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 jobs:
@@ -19,14 +19,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
-      - name: Preparar ambiente
+      - name: Preparar ambiente (curl, jq, gh)
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq curl
+          sudo apt-get install -y curl jq gh
           mkdir -p out
 
       - name: Baixar CSVs (Worker → Bounce → Direto)
@@ -35,6 +36,7 @@ jobs:
           set -euo pipefail
           cd out
 
+          # opções comuns do curl (modo "anônimo" sem cookies)
           COMMON_CURL_OPTS=(
             -L --fail --http1.1 --ipv4
             --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused
@@ -45,14 +47,18 @@ jobs:
             -H "Accept-Encoding: identity"
             -H "Pragma: no-cache"
             -H "Cache-Control: no-cache"
-            -H "Cookie:" # sem cookies (incógnito)
+            -H "Cookie:"
           )
 
           small_check () {
             local f="$1" min="$2"
-            local sz; sz=$(wc -c < "$f" | tr -d ' ')
+            local sz
+            sz=$(wc -c < "$f" | tr -d ' ')
             echo ">> $f bytes=$sz"
-            [ "$sz" -ge "$min" ] || { echo "!! Pequeno demais ($sz < $min)"; return 66; }
+            if [ "$sz" -lt "$min" ]; then
+              echo "!! Pequeno demais ($sz < $min)"
+              return 66
+            fi
           }
 
           try_all () {
@@ -89,7 +95,7 @@ jobs:
           P_BRUT="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"
           P_BENF="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"
 
-          # Arrecadação tende a ser bem grande → checagem mínima mais alta
+          # Arrecadação é grande → threshold maior para detectar HTML de erro
           try_all "$A_ARREC" "CFEM_Arrecadacao.csv" 4096
           try_all "$A_DIST"  "CFEM_Distribuicao.csv" 2048
           try_all "$A_AUTO"  "CFEM_Autuacao.csv"     2048
@@ -98,21 +104,26 @@ jobs:
 
           echo ">> Amostras (head):"
           for f in *.csv; do
-            echo "---- $f"; head -n 5 "$f" || true
+            echo "---- $f"
+            head -n 5 "$f" || true
           done
 
       - name: Recriar release 'latest'
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view latest >/dev/null 2>&1; then gh release delete latest -y || true; fi
+          if gh release view latest >/dev/null 2>&1; then
+            gh release delete latest -y || true
+          fi
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
           gh release create latest --title "latest" --notes "Atualização automática via CF Worker (CSV cru, bounce e fallback)."
 
       - name: Enviar assets
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
@@ -126,5 +137,9 @@ jobs:
             --clobber
 
       - name: Listar assets
-        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
-        run: gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
