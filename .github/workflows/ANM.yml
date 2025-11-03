@@ -2,14 +2,14 @@ name: Sync ANM → GitHub Release (via CF Worker, CSV cru + fallback)
 
 on:
   schedule:
-    - cron: "15 6 * * *"  # 06:15 UTC (~03:15 BRT)
+    - cron: "15 6 * * *" # 06:15 UTC (~03:15 BRT)
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"  # usa ?u=URL CRUA
+  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev" # usa ?u=URL CRUA
   UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 jobs:
@@ -41,7 +41,7 @@ jobs:
             -L --fail --http1.1 --ipv4
             --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused
             --connect-timeout 60 --max-time 0
-            --speed-time 120 --speed-limit 16384
+            # Removidos: --speed-time 120 --speed-limit 16384
             -H "User-Agent: ${UA}"
             -H "Accept: text/csv,application/octet-stream,*/*;q=0.1"
             -H "Accept-Encoding: identity"
@@ -97,10 +97,10 @@ jobs:
 
           # Arrecadação é grande → threshold maior para detectar HTML de erro
           try_all "$A_ARREC" "CFEM_Arrecadacao.csv" 4096
-          try_all "$A_DIST"  "CFEM_Distribuicao.csv" 2048
-          try_all "$A_AUTO"  "CFEM_Autuacao.csv"     2048
-          try_all "$P_BRUT"  "Producao_Bruta.csv"    2048
-          try_all "$P_BENF"  "Producao_Beneficiada.csv" 2048
+          try_all "$A_DIST" "CFEM_Distribuicao.csv" 2048
+          try_all "$A_AUTO" "CFEM_Autuacao.csv" 2048
+          try_all "$P_BRUT" "Producao_Bruta.csv" 2048
+          try_all "$P_BENF" "Producao_Beneficiada.csv" 2048
 
           echo ">> Amostras (head):"
           for f in *.csv; do
