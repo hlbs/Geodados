@@ -1,15 +1,16 @@
-name: Sync ANM → GitHub Release (via Cloudflare Worker, CSV cru)
+name: Sync ANM → GitHub Release (via CF Worker, CSV cru + fallback)
 
 on:
   schedule:
-    - cron: "15 6 * * *"   # 06:15 UTC (~03:15 BRT)
+    - cron: "15 6 * * *"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 env:
-  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"  # usar ?u=URL CRUA (sem encode!)
+  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev" # ?u=URL CRUA
+  UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
 jobs:
   sync:
@@ -18,105 +19,100 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: Preparar ambiente
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
-          sudo apt-get install -y jq
+          sudo apt-get install -y jq curl
           mkdir -p out
 
-      - name: Baixar CSVs via Worker (incógnito + sem urlencode)
+      - name: Baixar CSVs (Worker → Bounce → Direto)
         shell: bash
         run: |
           set -euo pipefail
           cd out
 
-          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
-
-          # Sem cookies (simula janela anônima) + cabeçalhos "like browser"
           COMMON_CURL_OPTS=(
-            -L --fail-with-body --http1.1 --ipv4
+            -L --fail --http1.1 --ipv4
             --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused
             --connect-timeout 60 --max-time 0
             --speed-time 120 --speed-limit 16384
             -H "User-Agent: ${UA}"
             -H "Accept: text/csv,application/octet-stream,*/*;q=0.1"
             -H "Accept-Encoding: identity"
-            -H "Origin: https://app.anm.gov.br"
-            -H "Referer: https://app.anm.gov.br/"
             -H "Pragma: no-cache"
             -H "Cache-Control: no-cache"
-            -H "Cookie:"              # força SEM cookies
+            -H "Cookie:" # sem cookies (incógnito)
           )
 
           small_check () {
-            local f="$1"
-            local min="${2:-1024}"
-            local sz
-            sz=$(wc -c < "$f" | tr -d ' ')
+            local f="$1" min="$2"
+            local sz; sz=$(wc -c < "$f" | tr -d ' ')
             echo ">> $f bytes=$sz"
-            if [ "$sz" -lt "$min" ]; then
-              echo "!! Arquivo muito pequeno (provável JSON/HTML de erro). Dump parcial:"
-              head -c 800 "$f" || true
-              return 66
+            [ "$sz" -ge "$min" ] || { echo "!! Pequeno demais ($sz < $min)"; return 66; }
+          }
+
+          try_all () {
+            local src="$1" out="$2" min="${3:-2048}"
+
+            echo "==> 1) Worker direto"
+            if curl "${COMMON_CURL_OPTS[@]}" --continue-at - -o "${out}.part" \
+              "${WORKER_BASE}/?u=${src}"; then
+              mv "${out}.part" "$out" && small_check "$out" "$min" && return 0
             fi
-            return 0
+            rm -f "${out}.part" || true
+
+            echo "==> 2) Worker bounce → 302 → origin"
+            if curl "${COMMON_CURL_OPTS[@]}" --continue-at - -o "${out}.part" \
+              "${WORKER_BASE}/?bounce=1&u=${src}"; then
+              mv "${out}.part" "$out" && small_check "$out" "$min" && return 0
+            fi
+            rm -f "${out}.part" || true
+
+            echo "==> 3) Direto no origin (fallback final)"
+            if curl "${COMMON_CURL_OPTS[@]}" --continue-at - -o "${out}.part" \
+              "${src}"; then
+              mv "${out}.part" "$out" && small_check "$out" "$min" && return 0
+            fi
+            rm -f "${out}.part" || true
+
+            echo "ERRO FATAL: Não foi possível baixar $src"
+            return 1
           }
 
-          dl_worker () {
-            local src="$1" out="$2"
-            local url="${WORKER_BASE}/?u=${src}"   # URL CRUA, sem urlencode
-            echo ">> [worker] GET $url"
-            # resume habilitado; grava .part e move se ok
-            curl "${COMMON_CURL_OPTS[@]}" --continue-at - -o "${out}.part" "$url"
-            mv "${out}.part" "$out"
-            small_check "$out" 2048
-          }
-
-          # Fontes ANM (todas via Worker)
           A_ARREC="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"
           A_DIST="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv"
           A_AUTO="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"
           P_BRUT="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"
           P_BENF="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"
 
-          # Downloads
-          dl_worker "$A_ARREC" "CFEM_Arrecadacao.csv"
-          dl_worker "$A_DIST"  "CFEM_Distribuicao.csv"
-          dl_worker "$A_AUTO"  "CFEM_Autuacao.csv"
-          dl_worker "$P_BRUT"  "Producao_Bruta.csv"
-          dl_worker "$P_BENF"  "Producao_Beneficiada.csv"
+          # Arrecadação tende a ser bem grande → checagem mínima mais alta
+          try_all "$A_ARREC" "CFEM_Arrecadacao.csv" 4096
+          try_all "$A_DIST"  "CFEM_Distribuicao.csv" 2048
+          try_all "$A_AUTO"  "CFEM_Autuacao.csv"     2048
+          try_all "$P_BRUT"  "Producao_Bruta.csv"    2048
+          try_all "$P_BENF"  "Producao_Beneficiada.csv" 2048
 
-          echo ">> Amostras:"
+          echo ">> Amostras (head):"
           for f in *.csv; do
-            echo "---- $f"
-            head -n 5 "$f" || true
+            echo "---- $f"; head -n 5 "$f" || true
           done
 
-      - name: Recriar release 'latest' (evita conflitos de tag/asset)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Recriar release 'latest'
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         shell: bash
         run: |
           set -euo pipefail
-          # Remove release/tag se existir (evita Validation Failed: already_exists)
-          if gh release view latest >/dev/null 2>&1; then
-            gh release delete latest -y || true
-          fi
+          if gh release view latest >/dev/null 2>&1; then gh release delete latest -y || true; fi
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
+          gh release create latest --title "latest" --notes "Atualização automática via CF Worker (CSV cru, bounce e fallback)."
 
-          gh release create latest \
-            --title "latest" \
-            --notes "Atualização automática via Cloudflare Worker (CSV cru, sem urlencode)."
-
-      - name: Enviar assets (CSV cru)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Enviar assets
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         shell: bash
         run: |
           set -euo pipefail
@@ -130,6 +126,5 @@ jobs:
             --clobber
 
       - name: Listar assets
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        env: { GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} }
         run: gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
