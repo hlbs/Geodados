@@ -1,4 +1,4 @@
-name: Sync ANM → GitHub Release (CSV)
+name: Sync ANM → GitHub Release (via Cloudflare Worker, CSV cru)
 
 on:
   schedule:
@@ -8,95 +8,119 @@ on:
 permissions:
   contents: write
 
+env:
+  WORKER_BASE: "https://anm.hermesbarros-eng.workers.dev"  # usar ?u=URL CRUA (sem encode!)
+
 jobs:
   sync:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup tools
+      - name: Preparar ambiente
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq
           mkdir -p out
 
-      - name: Download ANM CSVs (no urlencode, resume, retries)
+      - name: Baixar CSVs via Worker (incógnito + sem urlencode)
         shell: bash
         run: |
           set -euo pipefail
           cd out
 
-          dl () {
-            SRC="$1"; OUT="$2"
-            echo ">> GET $SRC"
-            # Download resiliente com resume (--continue-at -), sem timeout total,
-            # e com retry agressivo. SEM URL-ENCODE!
-            curl -L --fail-with-body --http1.1 --ipv4 \
-                 --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused \
-                 --connect-timeout 60 --max-time 0 \
-                 --speed-time 120 --speed-limit 16384 \
-                 --continue-at - \
-                 -H "User-Agent: Mozilla/5.0 (GitHub Actions)" \
-                 -H "Accept: text/csv,application/octet-stream,*/*;q=0.1" \
-                 -o "${OUT}.part" "$SRC"
+          UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
 
-            mv "${OUT}.part" "$OUT"
-            BYTES=$(wc -c < "$OUT" | tr -d ' ')
-            echo ">> $OUT bytes=$BYTES"
-            # Heurística: CSVs reais têm bem mais que 1KB; abaixo disso costuma ser HTML/erro.
-            if [ "$BYTES" -lt 1024 ]; then
-              echo "!! Arquivo muito pequeno (provável HTML de erro). Dump parcial:"
-              head -c 800 "$OUT" || true
-              exit 66
+          # Sem cookies (simula janela anônima) + cabeçalhos "like browser"
+          COMMON_CURL_OPTS=(
+            -L --fail-with-body --http1.1 --ipv4
+            --retry 12 --retry-delay 10 --retry-all-errors --retry-connrefused
+            --connect-timeout 60 --max-time 0
+            --speed-time 120 --speed-limit 16384
+            -H "User-Agent: ${UA}"
+            -H "Accept: text/csv,application/octet-stream,*/*;q=0.1"
+            -H "Accept-Encoding: identity"
+            -H "Origin: https://app.anm.gov.br"
+            -H "Referer: https://app.anm.gov.br/"
+            -H "Pragma: no-cache"
+            -H "Cache-Control: no-cache"
+            -H "Cookie:"              # força SEM cookies
+          )
+
+          small_check () {
+            local f="$1"
+            local min="${2:-1024}"
+            local sz
+            sz=$(wc -c < "$f" | tr -d ' ')
+            echo ">> $f bytes=$sz"
+            if [ "$sz" -lt "$min" ]; then
+              echo "!! Arquivo muito pequeno (provável JSON/HTML de erro). Dump parcial:"
+              head -c 800 "$f" || true
+              return 66
             fi
-
-            echo ">> Primeiras linhas:"
-            head -n 5 "$OUT" || true
+            return 0
           }
 
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"  "CFEM_Arrecadacao.csv"
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv" "CFEM_Distribuicao.csv"
-          dl "https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"     "CFEM_Autuacao.csv"
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"            "Producao_Bruta.csv"
-          dl "https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"      "Producao_Beneficiada.csv"
+          dl_worker () {
+            local src="$1" out="$2"
+            local url="${WORKER_BASE}/?u=${src}"   # URL CRUA, sem urlencode
+            echo ">> [worker] GET $url"
+            # resume habilitado; grava .part e move se ok
+            curl "${COMMON_CURL_OPTS[@]}" --continue-at - -o "${out}.part" "$url"
+            mv "${out}.part" "$out"
+            small_check "$out" 2048
+          }
 
-      - name: Remove release/tag 'latest' if exists (avoid conflicts)
+          # Fontes ANM (todas via Worker)
+          A_ARREC="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Arrecadacao.csv"
+          A_DIST="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Distribuicao.csv"
+          A_AUTO="https://app.anm.gov.br/DadosAbertos/ARRECADACAO/CFEM_Autuacao.csv"
+          P_BRUT="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Bruta.csv"
+          P_BENF="https://app.anm.gov.br/DadosAbertos/AMB/Producao_Beneficiada.csv"
+
+          # Downloads
+          dl_worker "$A_ARREC" "CFEM_Arrecadacao.csv"
+          dl_worker "$A_DIST"  "CFEM_Distribuicao.csv"
+          dl_worker "$A_AUTO"  "CFEM_Autuacao.csv"
+          dl_worker "$P_BRUT"  "Producao_Bruta.csv"
+          dl_worker "$P_BENF"  "Producao_Beneficiada.csv"
+
+          echo ">> Amostras:"
+          for f in *.csv; do
+            echo "---- $f"
+            head -n 5 "$f" || true
+          done
+
+      - name: Recriar release 'latest' (evita conflitos de tag/asset)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-
-          # Deleta release 'latest' se existir (ignorando erro)
+          # Remove release/tag se existir (evita Validation Failed: already_exists)
           if gh release view latest >/dev/null 2>&1; then
-            echo ">> Deletando release 'latest'…"
             gh release delete latest -y || true
           fi
-
-          # Deleta tag local e remota 'latest' se existirem
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
 
-      - name: Create release 'latest' and upload CSV files (no gzip)
+          gh release create latest \
+            --title "latest" \
+            --notes "Atualização automática via Cloudflare Worker (CSV cru, sem urlencode)."
+
+      - name: Enviar assets (CSV cru)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
           cd out
-
-          echo ">> Criando release 'latest'…"
-          gh release create latest \
-            --title "latest" \
-            --notes "Atualização automática dos dados ANM (CSV sem URL-encode)" \
-            --latest
-
-          echo ">> Enviando assets CSV…"
-          # gh lida com arquivos grandes como asset de release (limite por arquivo ~2GB)
           gh release upload latest \
             CFEM_Arrecadacao.csv \
             CFEM_Distribuicao.csv \
@@ -105,8 +129,7 @@ jobs:
             Producao_Beneficiada.csv \
             --clobber
 
-      - name: Show release assets
+      - name: Listar assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
+        run: gh release view latest --json assets --jq '.assets[] | "\(.name)\t\(.size)"'
