@@ -1,4 +1,4 @@
-name: Sync ANM → GitHub Release (via CF Worker, CSV cru + fallback)
+name: Sync ANM → GitHub Release (via CF Worker REVISADO)
 
 on:
   schedule:
@@ -108,18 +108,28 @@ jobs:
             head -n 5 "$f" || true
           done
 
-      - name: Recriar release 'latest'
+      - name: Recriar tag e release 'latest'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
+          
+          # 1. Deleta a release e a tag remotas (se existirem)
           if gh release view latest >/dev/null 2>&1; then
             gh release delete latest -y || true
           fi
           git tag -d latest 2>/dev/null || true
           git push origin :refs/tags/latest 2>/dev/null || true
-          gh release create latest --title "latest" --notes "Atualização automática via CF Worker (CSV cru, bounce e fallback)."
+          
+          # 2. Cria a tag 'latest' no commit atual (HEAD)
+          git tag latest
+          git push origin latest
+          
+          # 3. Cria a release 'latest' APONTANDO para a tag recém-criada
+          gh release create latest \
+            --title "Latest Data Update" \
+            --notes "Atualização automática via CF Worker (CSV cru, bounce e fallback)."
 
       - name: Enviar assets
         env:
@@ -128,13 +138,8 @@ jobs:
         run: |
           set -euo pipefail
           cd out
-          gh release upload latest \
-            CFEM_Arrecadacao.csv \
-            CFEM_Distribuicao.csv \
-            CFEM_Autuacao.csv \
-            Producao_Bruta.csv \
-            Producao_Beneficiada.csv \
-            --clobber
+          # Usa curinga (*.csv) para carregar todos os arquivos de uma vez e --clobber para sobrescrever
+          gh release upload latest *.csv --clobber
 
       - name: Listar assets
         env:
