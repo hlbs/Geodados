@@ -1,4 +1,4 @@
-name: Sync ANM → GitHub Release (via CF Worker REVISADO)
+name: Sync ANM → GitHub Release (via CF Worker REVISADO 02)
 
 on:
   schedule:
